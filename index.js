@@ -12,8 +12,10 @@ const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
-const { exec, spawn } = require('child_process');
+const { exec } = require('child_process');
 const https = require('https');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
 // 🌐 Keep-Alive Server
 const PORT = process.env.PORT || 8080;
@@ -24,7 +26,7 @@ http.createServer((req, res) => {
     console.log(`🌐 Keep-Alive Server running on port ${PORT}`);
 });
 
-// Cache Setup for Retry Counters (Fixes Encryption Errors)
+// Cache Setup for Retry Counters (Fixes Encryption & "Waiting for message" Errors)
 let NodeCache;
 let msgRetryCounterCache;
 try {
@@ -187,6 +189,52 @@ let isPairingRequested = false;
 let sock = null;
 let ownerEmojiIndex = 0;
 
+// Cinesubz Scraper Functions
+async function searchCinesubz(query) {
+    try {
+        const url = `https://cinesubz.co/?s=${encodeURIComponent(query)}`;
+        const { data } = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const $ = cheerio.load(data);
+        const results = [];
+
+        $('div.result-item, article.item').each((i, el) => {
+            const title = $(el).find('div.title a, h3.title a').text().trim();
+            const link = $(el).find('div.title a, h3.title a').attr('href');
+            const img = $(el).find('img').attr('src');
+            if (title && link) {
+                results.push({ title, link, img });
+            }
+        });
+        return results;
+    } catch (e) {
+        return [];
+    }
+}
+
+async function getMovieDetails(movieUrl) {
+    try {
+        const { data } = await axios.get(movieUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const $ = cheerio.load(data);
+
+        const title = $('h1.entry-title, h1').first().text().trim() || 'Movie Details';
+        const img = $('div.poster img, div.entry-content img').first().attr('src') || '';
+        const desc = $('div.entry-content p').first().text().trim() || 'No description available.';
+
+        const downloadLinks = [];
+        $('a[href*="mega"], a[href*="drive.google"], a[href*="pixeldrain"], a[href*="direct"], a.download-btn, div.download-links a').each((i, el) => {
+            const linkName = $(el).text().trim() || `Option ${i + 1}`;
+            const link = $(el).attr('href');
+            if (link && link.startsWith('http')) {
+                downloadLinks.push({ name: linkName, url: link });
+            }
+        });
+
+        return { title, img, desc, downloadLinks };
+    } catch (e) {
+        return null;
+    }
+}
+
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     
@@ -211,16 +259,16 @@ async function connectToWhatsApp() {
         browser: Browsers.ubuntu("Chrome"),
         generateHighQualityLinkPreview: true,
         
-        // Instant Startup & Fast Sync Configuration
+        // Fast Instant Startup Configs
         syncFullHistory: false,
         fireInitQueries: false,
         shouldSyncHistoryMessage: () => false,
         emitOwnEvents: true, 
         markOnlineOnConnect: config.botPresence === 'available',
-        connectTimeoutMs: 30000,
+        connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 0,
-        keepAliveIntervalMs: 15000,
-        retryRequestDelayMs: 250,
+        keepAliveIntervalMs: 25000,
+        retryRequestDelayMs: 500,
         msgRetryCounterCache,
         cachedGroupMetadata: async (jid) => store?.groupMetadata?.[jid],
 
@@ -233,29 +281,11 @@ async function connectToWhatsApp() {
                     return undefined;
                 }
             }
-            return undefined;
+            return { conversation: 'Hello' };
         }
     });
 
     if (store) store.bind(sock.ev);
-
-    // Continuous 24/7 Auto Refresh (Every 6 Hours)
-    const SIX_HOURS = 6 * 60 * 60 * 1000;
-    setTimeout(() => {
-        setInterval(async () => {
-            try {
-                const ownerJid = `${PHONE_NUMBER}@s.whatsapp.net`;
-                if (sock) {
-                    await sock.sendMessage(ownerJid, { 
-                        text: `♻️ *${config.botName} Auto-Refreshing Connection...*\n\n` +
-                              `⏰ පැය 6 කාල රාමුව අනුව සේවා සුමටව පවත්වා ගැනීමට Reconnect වෙනවා.` 
-                    }).catch(() => {});
-                    
-                    sock.ws.close();
-                }
-            } catch (err) {}
-        }, SIX_HOURS);
-    }, 10000);
 
     // Connection Handler
     sock.ev.on('connection.update', async (update) => {
@@ -283,12 +313,12 @@ async function connectToWhatsApp() {
             console.log(`⚠️ Connection closed (Status: ${statusCode}). Reconnecting...`);
             
             if (statusCode !== DisconnectReason.loggedOut) {
-                setTimeout(() => connectToWhatsApp(), 2000);
+                setTimeout(() => connectToWhatsApp(), 3000);
             } else {
                 console.log("Session Logged Out. Please clear auth folder and pair again.");
             }
         } else if (connection === 'open') {
-            console.log(`✅ ${config.botName} - Fast Connected & Ready!`);
+            console.log(`✅ ${config.botName} - Connected Successfully & Ready!`);
             isPairingRequested = false;
 
             try {
@@ -405,6 +435,80 @@ async function connectToWhatsApp() {
             }
 
             const currentState = userState.get(from);
+
+            // ----------------------------------------------------
+            // 🎬 MOVIE SELECTION & DOWNLOAD WORKFLOW (REPLY HANDLERS)
+            // ----------------------------------------------------
+            if (currentState && typeof currentState === 'object' && currentState.type === 'MOVIE_SEARCH_LIST') {
+                const choice = parseInt(textMessage.trim());
+                if (!isNaN(choice) && choice > 0 && choice <= currentState.results.length) {
+                    const selectedMovie = currentState.results[choice - 1];
+                    userState.delete(from);
+
+                    await sock.sendMessage(from, { text: `⏳ *Fetching Details for:* _${selectedMovie.title}_...` }, sendOptions);
+                    const movieData = await getMovieDetails(selectedMovie.link);
+
+                    if (!movieData) {
+                        return sock.sendMessage(from, { text: `❌ Movie details ලබා ගැනීමට නොහැකි විය.` }, sendOptions);
+                    }
+
+                    userState.set(from, {
+                        type: 'MOVIE_DOWNLOAD_LIST',
+                        links: movieData.downloadLinks,
+                        title: movieData.title
+                    });
+
+                    let detailsCard = `🎬 *${movieData.title.toUpperCase()}*\n\n` +
+                                       `📝 *Description:* ${movieData.desc.substring(0, 300)}...\n\n` +
+                                       `🔗 *Movie Link:* ${selectedMovie.link}`;
+
+                    if (movieData.img) {
+                        await sock.sendMessage(from, { image: { url: movieData.img }, caption: detailsCard }, sendOptions);
+                    } else {
+                        await sock.sendMessage(from, { text: detailsCard }, sendOptions);
+                    }
+
+                    // Download Menu
+                    let dlText = `📥 *DOWNLOAD OPTIONS - ${movieData.title}*\n\n` +
+                                 `Reply with the option number to download:\n\n`;
+
+                    if (movieData.downloadLinks.length === 0) {
+                        dlText += `❌ direct download links හමු නොවීය.`;
+                    } else {
+                        movieData.downloadLinks.forEach((item, idx) => {
+                            dlText += `*${idx + 1}* - ${item.name}\n`;
+                        });
+                    }
+
+                    return sock.sendMessage(from, { text: dlText }, sendOptions);
+                }
+            }
+
+            if (currentState && typeof currentState === 'object' && currentState.type === 'MOVIE_DOWNLOAD_LIST') {
+                const choice = parseInt(textMessage.trim());
+                if (!isNaN(choice) && choice > 0 && choice <= currentState.links.length) {
+                    const selectedLink = currentState.links[choice - 1];
+                    userState.delete(from);
+
+                    await sock.sendMessage(from, { 
+                        text: `🚀 *Downloading Movie File:* _${currentState.title}_\n\n⚠️ *මෙම ක්‍රියාවලියට File Size එක අනුව විනාඩි කිහිපයක් ගතවිය හැක...*` 
+                    }, sendOptions);
+
+                    try {
+                        await sock.sendMessage(from, {
+                            document: { url: selectedLink.url },
+                            mimetype: 'video/mp4',
+                            fileName: `${currentState.title.replace(/[^a-zA-Z0-9]/g, '_')}.mp4`,
+                            caption: `🎬 *${currentState.title}*\n\nDownloaded via ${config.botName}`
+                        }, sendOptions);
+                    } catch (e) {
+                        await sock.sendMessage(from, { 
+                            text: `❌ *Direct Download Error!* WhatsApp හරහා සෘජුවම එැවීමට නොහැකි තරම් File එක විශාල විය හැක.\n\n🔗 *Direct Download Link:* ${selectedLink.url}` 
+                        }, sendOptions);
+                    }
+                    return;
+                }
+            }
 
             if (isOwner && currentState && typeof currentState === 'object' && currentState.type === 'CONFIRM_TOKEN') {
                 if (textMessage === '1') {
@@ -595,6 +699,41 @@ async function connectToWhatsApp() {
             const args = textMessage.slice(config.currentPrefix.length).trim().split(/ +/);
             const command = args.shift().toLowerCase();
 
+            // ----------------------------------------------------
+            // 🎬 .cinesubz & .movie SEARCH COMMAND
+            // ----------------------------------------------------
+            if (command === 'cinesubz' || command === 'movie') {
+                const query = args.join(' ').trim();
+                if (!query) {
+                    return sock.sendMessage(from, { 
+                        text: `⚠️ *භාවිතය:* ${config.currentPrefix}${command} <Movie Name>\n*Example:* ${config.currentPrefix}${command} King Kong` 
+                    }, sendOptions);
+                }
+
+                await sock.sendMessage(from, { text: `🔍 *Searching Cinesubz for:* _${query}_...` }, sendOptions);
+
+                const searchResults = await searchCinesubz(query);
+
+                if (searchResults.length === 0) {
+                    return sock.sendMessage(from, { text: `❌ *${query}* වෙනුවෙන් Cinesubz හි කිසිදු Movie එකක් හමු නොවීය.` }, sendOptions);
+                }
+
+                userState.set(from, {
+                    type: 'MOVIE_SEARCH_LIST',
+                    results: searchResults
+                });
+
+                let menuMsg = `🎬 *CINESUBZ MOVIE SEARCH RESULTS*\n\n` +
+                              `🔎 *Query:* ${query}\n` +
+                              `Reply with the option number to view details:\n\n`;
+
+                searchResults.forEach((item, index) => {
+                    menuMsg += `*${index + 1}* - ${item.title}\n`;
+                });
+
+                return sock.sendMessage(from, { text: menuMsg }, sendOptions);
+            }
+
             // .info Command
             if (command === 'info') {
                 if (!isGroup) {
@@ -703,6 +842,8 @@ async function connectToWhatsApp() {
                                  `*AVAILABLE COMMANDS:*\n` +
                                  `┌──────────────\n` +
                                  `│ 📜 *${config.currentPrefix}menu* - Display Menu\n` +
+                                 `│ 🎬 *${config.currentPrefix}movie* - Search Movies\n` +
+                                 `│ 🍿 *${config.currentPrefix}cinesubz* - Search Cinesubz\n` +
                                  `│ 🏓 *${config.currentPrefix}ping* - Speed Test\n` +
                                  `│ 📋 *${config.currentPrefix}info* - Get Group Description\n` +
                                  `│ ⚙️ *${config.currentPrefix}setting* - Bot Settings (Owner Only)\n` +
@@ -723,17 +864,17 @@ async function connectToWhatsApp() {
                 await sock.sendMessage(from, { text: `📿 *Pong!* Speed: *${end - start}ms*` }, sendOptions);
             }
 
-            // Update Command
+            // Update Command (Fixed Clean Restart Logic)
             else if (command === 'update') {
                 if (!isOwner) return;
                 await sock.sendMessage(from, { text: `🔄 Updating from GitHub...` }, sendOptions);
                 exec('git pull', async (error, stdout) => {
                     if (error) return await sock.sendMessage(from, { text: `❌ Update Failed: ${error.message}` }, sendOptions);
-                    await sock.sendMessage(from, { text: `✅ Updated:\n\`\`\`${stdout}\`\`\`\nRestarting Bot Process...` }, sendOptions);
+                    await sock.sendMessage(from, { text: `✅ Updated Successfully:\n\`\`\`${stdout}\`\`\`\nRestarting Process Safely...` }, sendOptions);
                     
                     setTimeout(() => {
-                        sock.ws.close();
-                    }, 2000);
+                        process.exit(0);
+                    }, 1500);
                 });
             }
 
